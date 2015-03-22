@@ -1,5 +1,6 @@
 (use (srfi 1)
      (srfi 4)
+     (srfi 69)
      ncurses)
 
 (define logfile (open-output-file "error.log"))
@@ -30,19 +31,47 @@
       '()
       (cons (get-mem mem i) (loop (- s 1) (+ i 1))))))
 
+(define (purge-duplicates lst)
+  (let loop ([l lst])
+   (if (or (null? l) (null? (cdr l)))
+     l
+     (if (equal? (car l) (cadr l))
+       (loop (cddr l))
+       (cons (car l) (cons (cadr l) (loop (cddr l))))))))
+
+(define (list-counts lst)
+  (let ([h (make-hash-table)])
+   (let loop ([l lst])
+    (if (not (null? l))
+      (begin
+        (hash-table-update!/default h (car l) (lambda (x) (+ x 1)) 0)
+        (loop (cdr l)))))
+   (hash-table->alist h)))
+
 (define (clear-screen)
   (make-u8vector (* 64 32) 0))
 
+(define (clear-screen-alist) '())
+
 (define (get-pixel screen x y)
-  (u8vector-ref screen (+ (* y 64) x)))
+  (u8vector-ref screen (+ (* (modulo y 32) 64) (modulo x 64))))
+
+(define (get-pixel-alist screen x y)
+  (let ([v (assoc (list x y) (list-counts screen))])
+   (if v
+     (if (odd? (cdr v)) 1 0)
+     0)))
 
 (define (set-pixel screen x y)
-  (u8vector-set! screen (+ (* y 64) x) 1)
+  (u8vector-set! screen (+ (* (modulo y 32) 64) (modulo x 64)) 1)
   screen)
 
 (define (unset-pixel screen x y)
-  (u8vector-set! screen (+ (* y 64) x) 0)
+  (u8vector-set! screen (+ (* (modulo y 32) 64) (modulo x 64)) 0)
   screen)
+
+(define (flip-pixel-alist screen x y)
+  (cons (list x y) screen))
 
 (define (get-reg regs reg)
   (cdr (assq reg regs)))
@@ -128,9 +157,11 @@
 (define *chip8-opcodes*
   (list
     (make-instruction #x0000 (lambda (opcode mem regs screen delay-timer sound-timer stack)
-                               (cond [(eq? opcode #x00E0) (values mem regs (clear-screen) delay-timer sound-timer stack)]
+                               (cond [(eq? opcode #x00E0) (values mem regs (clear-screen-alist) delay-timer sound-timer stack)]
                                      [(eq? opcode #x00EE) (values mem (set-reg regs 'pc (get-stack-top stack)) screen delay-timer sound-timer (pop-stack stack))]
-                                     [else (format #t "invalid opcode ~X~%" opcode)])))
+                                     [else (begin
+                                             (format logfile "invalid opcode ~X~%" opcode)
+                                             (exit 1))])))
     (make-instruction #x1000 (lambda (opcode mem regs screen delay-timer sound-timer stack)
                                (values mem (set-reg regs 'pc (- (bitwise-and opcode #x0FFF) 2)) screen delay-timer sound-timer stack)))
     (make-instruction #x2000 (lambda (opcode mem regs screen delay-timer sound-timer stack)
@@ -166,12 +197,15 @@
                                                           [regs (if (<= 0 diff) (set-reg regs #xF 1) regs)])
                                                      (values mem (set-reg regs x (modulo diff 255)) screen delay-timer sound-timer stack))]
                                       [(= hex #x6) (let ([regs (if (= (bitwise-and x #x01) 1) (set-reg regs #xF 1) regs)])
-                                                     (values mem (set-reg regs x (/ (get-reg regs x) 2)) screen delay-timer sound-timer stack))]
+                                                     (values mem (set-reg regs x (quotient (get-reg regs x) 2)) screen delay-timer sound-timer stack))]
                                       [(= hex #x7) (let* ([diff (- (get-reg regs y) (get-reg regs x))]
                                                           [regs (if (<= 0 diff) (set-reg regs #xF 1) regs)])
                                                      (values mem (set-reg regs x (modulo diff 255)) screen delay-timer sound-timer stack))]
                                       [(= hex #xE) (let ([regs (if (= (arithmetic-shift opcode -7) 1) (set-reg regs #xF 1) regs)])
-                                                     (values mem (set-reg regs x (* (get-reg regs x) 2)) screen delay-timer sound-timer stack))]))))
+                                                     (values mem (set-reg regs x (* (get-reg regs x) 2)) screen delay-timer sound-timer stack))]
+                                      [else (begin
+                                              (format logfile "invalid opcode ~X~%" opcode)
+                                              (exit 1))]))))
     (make-instruction #x9000 (lambda (opcode mem regs screen delay-timer sound-timer stack)
                                (if (= (get-reg regs (arithmetic-shift (bitwise-and opcode #x0F00) -8)) (arithmetic-shift (bitwise-and opcode #x00F0) -4))
                                  (values mem regs screen delay-timer sound-timer stack)
@@ -197,9 +231,9 @@
                                                                         [row (car sprite)])
                                                               (if (< ix maxx)
                                                                 (loopx (if (= (arithmetic-shift (bitwise-and row #b10000000) -7) 1)
-                                                                         (if (= (get-pixel (car sx) ix iy) 1)
-                                                                           (cons (unset-pixel (car sx) ix iy) 1)
-                                                                           (cons (set-pixel (car sx) ix iy) 0))
+                                                                         (if (= (get-pixel-alist (car sx) ix iy) 1)
+                                                                           (cons (flip-pixel-alist (car sx) ix iy) 1)
+                                                                           (cons (flip-pixel-alist (car sx) ix iy) 0))
                                                                          sx)
                                                                        (+ ix 1)
                                                                        (arithmetic-shift row 1))
@@ -216,7 +250,9 @@
                                       (if (key-pressed (get-reg regs (arithmetic-shift (bitwise-and opcode #x0F00) -8)))
                                         (values mem regs screen delay-timer sound-timer stack)
                                         (values mem (set-reg regs 'pc (+ (get-reg regs 'pc) 2)) screen delay-timer sound-timer stack))]
-                                     [else (format #t "invalid opcode ~X~%" opcode)])))
+                                     [else (begin
+                                             (format logfile "invalid opcode ~X~%" opcode)
+                                             (exit 1))])))
     (make-instruction #xF000 (lambda (opcode mem regs screen delay-timer sound-timer stack)
                                (let ([byte (bitwise-and opcode #x00FF)]
                                      [x (arithmetic-shift (bitwise-and opcode #x0F00) -8)])
@@ -240,7 +276,9 @@
                                                                     (if (< c x)
                                                                       (loop (set-reg r c (get-mem mem (+ (get-reg regs 'i) c))) (+ c 1))
                                                                       r)) screen delay-timer sound-timer stack)]
-                                       [else (format #t "invalid opcode ~X~%" opcode)]))))))
+                                       [else (begin
+                                               (format logfile "invalid opcode ~X~%" opcode)
+                                               (exit 1))]))))))
 
 (define *chip8-font*
   '(#xF0 #x90 #x90 #x90 #xF0 ; 0
@@ -285,6 +323,16 @@
        (loop (+ i 1)))))
   (wrefresh (stdscr)))
 
+(define (draw-screen-alist al)
+  ;(wclear (stdscr))
+  (let loop ([l (list-counts al)])
+   (if (not (null? l))
+     (begin
+       (mvaddch (cadaar l) (caaar l) (if (odd? (cdar l)) #\# #\space))
+       (loop (cdr l)))))
+  (wrefresh (stdscr))
+  al)
+
 (define (draw-screen-debug screen)
   (format #t "~A~%" screen))
 
@@ -294,9 +342,11 @@
   (noecho)
   (keypad (stdscr) #t)
   (nodelay (stdscr) #t)
+  (wclear (stdscr))
+  (curs_set 0)
   (let loop ([mem memory]
              [regs registers]
-             [screen (clear-screen)]
+             [screen (clear-screen-alist)]
              [delay-timer 0]
              [sound-timer 0]
              [stack (cons (make-vector 16) 0)]
@@ -304,17 +354,15 @@
     (let* ([new-time (current-milliseconds)]
            [delta (- new-time current-time)])
       (if (> delta 16.6667)
-        (begin
-          (draw-screen screen)
-          (let* ([pos (get-reg regs 'pc)]
-                 [opcode (bitwise-ior (arithmetic-shift (get-mem memory pos) 8) (get-mem memory (+ pos 1)))]
-                 [ins (assv (bitwise-and opcode #xF000) opcode-table)]
-                 [dummy (format logfile "op: ~X, adjusted: ~X, regs: ~A~%" opcode (bitwise-and opcode #xF000) regs)]
-                 [cb (instruction-callback ins)])
-            (if (not (= opcode 0))
-              (call-with-values (lambda () (cb opcode mem regs screen delay-timer sound-timer stack))
-                                (lambda (mem regs screen delay-timer sound-timer stack) (loop mem (set-reg regs 'pc (+ (get-reg regs 'pc) 2)) screen (timer-down delay-timer) (timer-down sound-timer) stack new-time)))
-              (endwin))))
+        (let* ([pos (get-reg regs 'pc)]
+               [opcode (bitwise-ior (arithmetic-shift (get-mem memory pos) 8) (get-mem memory (+ pos 1)))]
+               [ins (assv (bitwise-and opcode #xF000) opcode-table)]
+               [dummy (format logfile "op: ~X, adjusted: ~X, regs: ~A~%" opcode (bitwise-and opcode #xF000) regs)]
+               [cb (instruction-callback ins)])
+          (if (not (= opcode 0))
+            (call-with-values (lambda () (cb opcode mem regs screen delay-timer sound-timer stack))
+                              (lambda (mem regs screen delay-timer sound-timer stack) (loop mem (set-reg regs 'pc (+ (get-reg regs 'pc) 2)) (draw-screen-alist screen) (timer-down delay-timer) (timer-down sound-timer) stack new-time)))
+            (endwin)))
         (loop mem regs screen delay-timer sound-timer stack current-time)))))
 
 (emulator-loop *chip8-opcodes* (load-program (load-font (make-u8vector 4096 0)) (cadr (argv))) *chip8-registers*)
